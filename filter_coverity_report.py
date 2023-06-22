@@ -4,7 +4,7 @@ import re
 import sys
 import typing
 
-# PII: Program Identifiable Information ;)
+import click
 
 
 class Sanitizer:
@@ -18,13 +18,18 @@ class Sanitizer:
             r"\".*?\"": "<pii>",
         }
 
+        if not data:
+            return data
+
         for key, value in pii_map.items():
-            data = re.sub(key, value, data)
+            data, sub_count = re.subn(key, value, data)
+            if sub_count != 0:
+                continue
 
         return data
 
     @staticmethod
-    def _standardize_errors(error: str) -> str:
+    def _standardize_findings(finding: str) -> str:
         content_map = {
             ", taking false branch.": "Condition <pii>, taking false branch.",
             ", taking true branch.": "Condition <pii>, taking true branch.",
@@ -47,24 +52,25 @@ class Sanitizer:
         }
         replace_map = {
             r"([0-9]+\.)+ ": "",
-            r"Example [0-9]+[ \(cont.\)]*: ": ""
+            r"Example [0-9]+[ \(cont.\)]*: ": "",
+            "Type: ": "",
         }
 
-        for key, value in content_map.items():       
-            if key in error:
+        for key, value in content_map.items():
+            if key in finding:
                 return value
 
         for key, value in replace_map.items():
-            error = re.sub(key, value, error)
+            finding = re.sub(key, value, finding)
 
-        return error
-    
+        return finding
+
     @staticmethod
-    def sanitize_error(error: str) -> str:
-        error = Sanitizer._remove_pii_data(error)
-        error = Sanitizer._standardize_errors(error)
+    def sanitize_finding(finding: str) -> str:
+        finding = Sanitizer._remove_pii_data(finding)
+        finding = Sanitizer._standardize_findings(finding)
 
-        return error
+        return finding
 
     @staticmethod
     def sanitize_scope(scope: str) -> str:
@@ -72,69 +78,92 @@ class Sanitizer:
 
         return scope
 
-class ErrorsIndex:
+
+class FindingsIndex:
     _index: dict
+    _object_names: str
 
-    def __init__(self) -> None:
+    def __init__(self, object_names: str = None) -> None:
         self._index = {}
+        self._object_names = object_names if object_names else "findings"
 
-    def add_error(self, error: str, scope: str):
-        error = Sanitizer.sanitize_error(error)
+    def add_finding(self, finding: str, scope: str) -> None:
+        finding = Sanitizer.sanitize_finding(finding)
         scope = Sanitizer.sanitize_scope(scope)
 
-        if error not in self._index:
-            self._index[error] = [scope]
+        if finding not in self._index:
+            self._index[finding] = [scope]
         else:
-            self._index[error].append(scope)
+            self._index[finding].append(scope)
 
     def get_index(self) -> dict:
         return self._index
 
-    def count_errors(self) -> int:
+    def count_findings(self) -> int:
         return len(self._index.keys())
 
-    def get_unique_sorted_errors(self) -> typing.List[str]:
-        errors = list(self._index.keys())
-        errors.sort()
+    def get_unique_sorted_findings(self) -> typing.List[str]:
+        findings = list(self._index.keys())
+        findings.sort()
 
-        return errors
+        return findings
+
+    def print_content(self) -> None:
+        count = self.count_findings()
+        print(f"Found a total of {count} different {self._object_names}:")
+        for finding in self.get_unique_sorted_findings():
+            print(f"- {finding}")
 
 
-if len(sys.argv) != 3:
-    exit(0)
+@click.command()
+@click.option(
+    "--report",
+    type=str,
+    required=True,
+    help="Name of the report.",
+)
+@click.option(
+    "--limit",
+    type=int,
+    help="Maximum number of report's lines to process",
+)
+def parse(report: str, limit: int = None) -> None:
+    if not limit:
+        limit = sys.maxsize
 
-report_filename = sys.argv[1]
-max_lines_count = int(sys.argv[2])
+    vuln_index = FindingsIndex(object_names="vulnerability classes")
+    descriptors_index = FindingsIndex(object_names="descriptors")
+    with open(report, "r") as report_fd:
+        content = report_fd.read()
 
-index = ErrorsIndex()
-with open(report_filename, "r") as report:
-    content = report.read()
+        lines_count = 0
+        scope = None
+        description = None
+        for line in content.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
 
-    lines_count = 0
-    was_previously_scope = False
-    scope = None
-    error = None
-    for line in content.split("\n"):
-        line = line.strip()
+            if re.match(r".*?\:[0-9]+:[0-9]+:", line):
+                scope = line
+            elif scope != None:
+                description = line
 
-        if re.match(r".*?\:[0-9]+:[0-9]+:", line):
-            scope = line
-            was_previously_scope = True
-        else:
-            if was_previously_scope:
-                error = line
+                if "Type: " in line:
+                    vuln_index.add_finding(description, scope)
+                else:
+                    descriptors_index.add_finding(description, scope)
 
-            if scope != None:                
-                index.add_error(error, scope)
+                scope = False
 
-            was_previously_scope = False
+            lines_count += 1
+            if lines_count > limit:
+                break
 
-        lines_count += 1
-        if (lines_count > max_lines_count):
-            break
+    vuln_index.print_content()
+    print("")
+    descriptors_index.print_content()
 
-errors_count = index.count_errors()
-print(f"Found a total of {errors_count} different errors:")
-for error in index.get_unique_sorted_errors():
-    print(f"- {error}")
 
+if __name__ == "__main__":
+    parse()
